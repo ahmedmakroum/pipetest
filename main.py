@@ -1,52 +1,78 @@
 import apache_beam as beam
 from apache_beam.options.pipeline_options import PipelineOptions, GoogleCloudOptions
-from apache_beam.io import ReadFromText, WriteToBigQuery
+from apache_beam.io.gcp.bigquery import WriteToBigQuery
+from apache_beam.io import ReadFromText
+from apache_beam.io.textio import ReadAllFromText
+import csv
+import json
 
 class ParseCSV(beam.DoFn):
     def process(self, element):
-        import csv
-        from io import StringIO
+        for row in csv.DictReader([element]):
+            yield row
 
-        # Parse the CSV line
-        for row in csv.DictReader(StringIO(element)):
-            yield {
-                'time_micros': int(row['time_micros']),
-                'c_ip': row['c_ip'],
-                'c_ip_type': int(row['c_ip_type']),
-                'c_ip_region': row['c_ip_region'],
-                'cs_method': row['cs_method'],
-                'cs_uri': row['cs_uri'],
-                'sc_status': int(row['sc_status']),
-                'cs_bytes': int(row['cs_bytes']),
-                'sc_bytes': int(row['sc_bytes']),
-                'time_taken_micros': int(row['time_taken_micros']),
-                'cs_host': row['cs_host'],
-                'cs_referer': row['cs_referer'],
-                'cs_user_agent': row['cs_user_agent'],
-                's_request_id': row['s_request_id'],
-                'cs_operation': row['cs_operation'],
-                'cs_bucket': row['cs_bucket'],
-                'cs_object': row['cs_object'],
-            }
+class FilterAPICalls(beam.DoFn):
+    def process(self, element):
+        cs_uri = element['cs_uri']
+        if not cs_uri.startswith('/assets') and not cs_uri.startswith('/admin'):
+            yield element
+
+class CalculateTraffic(beam.DoFn):
+    def process(self, element):
+        element['total_bytes'] = int(element['cs_bytes']) + int(element['sc_bytes'])
+        yield element
+
+class AggregateMetrics(beam.DoFn):
+    def process(self, element):
+        key, values = element
+        total_calls = len(values)
+        total_traffic = sum(int(value['total_bytes']) for value in values) / (1024 * 1024 * 1024)  # Convert to GB
+        
+        pricing = 0
+        if total_calls > 500000000:
+            pricing = (total_calls - 500000000) / 1000000 * 13 + 4500000 + 800000
+        elif total_calls > 50000000:
+            pricing = (total_calls - 50000000) / 1000000 * 16 + 1000000
+        else:
+            pricing = total_calls / 1000000 * 20
+        
+        egress_cost = total_traffic * 0.1
+        total_cost = pricing + egress_cost
+        
+        yield {
+            'month': key,
+            'total_calls': total_calls,
+            'total_traffic_gb': total_traffic,
+            'api_call_cost': pricing,
+            'egress_cost': egress_cost,
+            'total_cost': total_cost
+        }
 
 def run():
-    options = PipelineOptions()
-    google_cloud_options = options.view_as(GoogleCloudOptions)
-    google_cloud_options.project = 'arcane-boulder-429415-s1'
-    google_cloud_options.job_name = 'csvtobq'
-    google_cloud_options.staging_location = 'gs://bucket1/staging'
-    google_cloud_options.temp_location = 'gs://bucket1/temp'
-    options.view_as(beam.options.pipeline_options.StandardOptions).runner = 'DataflowRunner'
+    pipeline_options = PipelineOptions()
+    gcp_options = pipeline_options.view_as(GoogleCloudOptions)
+    gcp_options.project = 'arcane-boulder-429415-s1'
+    gcp_options.job_name = 'api-traffic-cost-calculation'
+    gcp_options.staging_location = 'gs://bucket1/staging'
+    gcp_options.temp_location = 'gs://bucket1/temp'
+    pipeline_options.view_as(PipelineOptions).runner = 'DataflowRunner'
 
-    with beam.Pipeline(options=options) as p:
-        (p
-         | 'Read from GCS' >> ReadFromText('gs://bucketboti1/bucket1.csv', skip_header_lines=1)
-         | 'Parse CSV' >> beam.ParDo(ParseCSV())
-         | 'Write to BigQuery' >> WriteToBigQuery(
-             'test',
-             schema='time_micros:INTEGER, c_ip:STRING, c_ip_type:INTEGER, c_ip_region:STRING, cs_method:STRING, cs_uri:STRING, sc_status:INTEGER, cs_bytes:INTEGER, sc_bytes:INTEGER, time_taken_micros:INTEGER, cs_host:STRING, cs_referer:STRING, cs_user_agent:STRING, s_request_id:STRING, cs_operation:STRING, cs_bucket:STRING, cs_object:STRING',
-             write_disposition=beam.io.BigQueryDisposition.WRITE_TRUNCATE,
-             create_disposition=beam.io.BigQueryDisposition.CREATE_IF_NEEDED)
+    with beam.Pipeline(options=pipeline_options) as p:
+        (
+            p
+            | 'Read CSV files' >> ReadAllFromText('gs://bucketboti1/bucket1.csv')
+            | 'Parse CSV' >> beam.ParDo(ParseCSV())
+            | 'Filter API calls' >> beam.ParDo(FilterAPICalls())
+            | 'Calculate Traffic' >> beam.ParDo(CalculateTraffic())
+            | 'Add Month Key' >> beam.Map(lambda x: (x['time_micros'][:6], x))
+            | 'Group by Month' >> beam.GroupByKey()
+            | 'Aggregate Metrics' >> beam.ParDo(AggregateMetrics())
+            | 'Write to BigQuery' >> WriteToBigQuery(
+                table='arcane-boulder-429415-s1:test',
+                schema='month:STRING, total_calls:INTEGER, total_traffic_gb:FLOAT, api_call_cost:FLOAT, egress_cost:FLOAT, total_cost:FLOAT',
+                write_disposition=beam.io.BigQueryDisposition.WRITE_TRUNCATE,
+                create_disposition=beam.io.BigQueryDisposition.CREATE_IF_NEEDED
+            )
         )
 
 if __name__ == '__main__':
